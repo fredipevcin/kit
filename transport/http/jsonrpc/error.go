@@ -49,6 +49,10 @@ func (e *parseError) ErrorCode() int {
 
 type invalidRequestError struct{}
 
+func (e invalidRequestError) Error() string {
+	return ErrorMessage(e.ErrorCode())
+}
+
 func (e *invalidRequestError) ErrorCode() int {
 	return InvalidRequestError
 }

@@ -1,6 +1,10 @@
 package jsonrpc
 
-import "encoding/json"
+import (
+	"context"
+	"encoding/json"
+	"net/http"
+)
 
 // Request defines a JSON RPC request from the spec
 // http://www.jsonrpc.org/specification#request_object
@@ -56,9 +60,15 @@ func (id *RequestID) String() (string, error) {
 // Response defines a JSON RPC response from the spec
 // http://www.jsonrpc.org/specification#response_object
 type Response struct {
-	JSONRPC string      `json:"jsonrpc"`
-	Result  interface{} `json:"result,omitempty"`
-	Error   *Error      `json:"error,omitemty"`
+	JSONRPC     string      `json:"jsonrpc"`
+	Result      interface{} `json:"result,omitempty"`
+	Error       *Error      `json:"error,omitempty"`
+	RespHeaders http.Header `json:"-"`
+}
+
+// Headers returns response headers
+func (r Response) Headers() http.Header {
+	return r.RespHeaders
 }
 
 const (
@@ -68,3 +78,14 @@ const (
 	// ContentType defines the content type to be served.
 	ContentType string = "application/json; charset=utf-8"
 )
+
+type ctxHeaderKey struct{}
+
+func HeaderFromContext(ctx context.Context) (header http.Header, ok bool) {
+	header, ok = ctx.Value(ctxHeaderKey{}).(http.Header)
+	return
+}
+
+func HeaderNewContext(ctx context.Context, headers http.Header) context.Context {
+	return context.WithValue(ctx, ctxHeaderKey{}, headers)
+}

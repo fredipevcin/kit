@@ -7,62 +7,21 @@ import (
 	"io"
 	"net/http"
 
-	"github.com/go-kit/kit/endpoint"
-	"github.com/go-kit/kit/log"
 	httptransport "github.com/go-kit/kit/transport/http"
 )
 
-// Server wraps an endpoint and implements http.Handler.
-type Server struct {
-	ctx          context.Context
-	ecm          EndpointCodecMap
-	before       []httptransport.RequestFunc
-	after        []httptransport.ServerResponseFunc
-	errorEncoder httptransport.ErrorEncoder
-	finalizer    httptransport.ServerFinalizerFunc
-	logger       log.Logger
+type Handler interface {
+	ServeJSONRPC(ctx context.Context, params json.RawMessage) (interface{}, http.Header, error)
 }
 
-// NewServer constructs a new server, which implements http.Server.
-func NewServer(
-	ecm EndpointCodecMap,
-	options ...ServerOption,
-) *Server {
-	s := &Server{
-		ecm:          ecm,
-		errorEncoder: DefaultErrorEncoder,
-		logger:       log.NewNopLogger(),
-	}
-	for _, option := range options {
-		option(s)
-	}
-	return s
-}
+type ServiceMap map[string]Handler
 
-// EndpointCodec defines and Endpoint and its associated codecs
-type EndpointCodec struct {
-	Endpoint endpoint.Endpoint
-	Decode   DecodeRequestFunc
-	Encode   EncodeResponseFunc
-}
+type RequestFunc func(context.Context, http.Header) context.Context
 
-// EndpointCodecMap maps the Request.Method to the proper EndpointCodec
-type EndpointCodecMap map[string]EndpointCodec
+type ServiceResponseFunc func(context.Context, http.Header) context.Context
 
 // ServerOption sets an optional parameter for servers.
 type ServerOption func(*Server)
-
-// ServerBefore functions are executed on the HTTP request object before the
-// request is decoded.
-func ServerBefore(before ...httptransport.RequestFunc) ServerOption {
-	return func(s *Server) { s.before = append(s.before, before...) }
-}
-
-// ServerAfter functions are executed on the HTTP response writer after the
-// endpoint is invoked, but before anything is written to the client.
-func ServerAfter(after ...httptransport.ServerResponseFunc) ServerOption {
-	return func(s *Server) { s.after = append(s.after, after...) }
-}
 
 // ServerErrorEncoder is used to encode errors to the http.ResponseWriter
 // whenever they're encountered in the processing of a request. Clients can
@@ -72,19 +31,23 @@ func ServerErrorEncoder(ee httptransport.ErrorEncoder) ServerOption {
 	return func(s *Server) { s.errorEncoder = ee }
 }
 
-// ServerErrorLogger is used to log non-terminal errors. By default, no errors
-// are logged. This is intended as a diagnostic measure. Finer-grained control
-// of error handling, including logging in more detail, should be performed in a
-// custom ServerErrorEncoder or ServerFinalizer, both of which have access to
-// the context.
-func ServerErrorLogger(logger log.Logger) ServerOption {
-	return func(s *Server) { s.logger = logger }
+func NewServer(
+	sm ServiceMap,
+	options ...ServerOption,
+) *Server {
+	s := &Server{
+		sm:           sm,
+		errorEncoder: DefaultErrorEncoder,
+	}
+	for _, option := range options {
+		option(s)
+	}
+	return s
 }
 
-// ServerFinalizer is executed at the end of every HTTP request.
-// By default, no finalizer is registered.
-func ServerFinalizer(f httptransport.ServerFinalizerFunc) ServerOption {
-	return func(s *Server) { s.finalizer = f }
+type Server struct {
+	sm           ServiceMap
+	errorEncoder httptransport.ErrorEncoder
 }
 
 // ServeHTTP implements http.Handler.
@@ -95,72 +58,54 @@ func (s Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		io.WriteString(w, "405 must POST\n")
 		return
 	}
+
 	ctx := r.Context()
-
-	if s.finalizer != nil {
-		iw := &interceptingWriter{w, http.StatusOK}
-		defer func() { s.finalizer(ctx, iw.code, r) }()
-		w = iw
-	}
-
-	for _, f := range s.before {
-		ctx = f(ctx, r)
-	}
+	ctx = HeaderNewContext(ctx, r.Header)
 
 	// Decode the body into an  object
 	var req Request
 	err := json.NewDecoder(r.Body).Decode(&req)
 	if err != nil {
-		s.logger.Log("err", err)
-		s.errorEncoder(ctx, err, w)
+		s.errorEncoder(ctx, invalidRequestError{}, w)
 		return
 	}
 
 	// Get the endpoint and codecs from the map using the method
 	// defined in the JSON  object
-	ecm, ok := s.ecm[req.Method]
+	srv, ok := s.sm[req.Method]
 	if !ok {
 		err := methodNotFoundError(fmt.Sprintf("Method %s was not found.", req.Method))
-		s.logger.Log("err", err)
 		s.errorEncoder(ctx, err, w)
 		return
 	}
 
-	// Decode the JSON "params"
-	reqParams, err := ecm.Decode(ctx, req.Params)
+	resp, respHeaders, err := srv.ServeJSONRPC(ctx, req.Params)
 	if err != nil {
-		s.logger.Log("err", err)
 		s.errorEncoder(ctx, err, w)
 		return
 	}
 
-	// Call the Endpoint with the params
-	response, err := ecm.Endpoint(ctx, reqParams)
-	if err != nil {
-		s.logger.Log("err", err)
-		s.errorEncoder(ctx, err, w)
-		return
+	res := Response{
+		RespHeaders: respHeaders,
+		JSONRPC:     Version,
 	}
 
-	for _, f := range s.after {
-		ctx = f(ctx, w)
-	}
+	res.Result = resp
 
-	res := Response{}
-
-	// Encode the response from the Endpoint
-	resParams, err := ecm.Encode(ctx, response)
-	if err != nil {
-		s.logger.Log("err", err)
-		s.errorEncoder(ctx, err, w)
-		return
-	}
-
-	res.Result = resParams
-
-	w.Header().Set("Content-Type", ContentType)
-	json.NewEncoder(w).Encode(res)
+	httptransport.EncodeJSONResponse(ctx, w, res)
+	// err = httptransport.EncodeJSONResponse(ctx, w, res)
+	// if err != nil {
+	// 	s.errorEncoder(ctx, err, w)
+	// 	return
+	// }
 }
+
+// ServerFinalizerFunc can be used to perform work at the end of an HTTP
+// request, after the response has been written to the client. The principal
+// intended use is for request logging. In addition to the response code
+// provided in the function signature, additional response parameters are
+// provided in the context under keys with the ContextKeyResponse prefix.
+type ServerFinalizerFunc func(ctx context.Context, code int, r *http.Request)
 
 // DefaultErrorEncoder writes the error to the ResponseWriter,
 // as a json-rpc error response, with an InternalError status code.
@@ -210,4 +155,18 @@ type interceptingWriter struct {
 func (w *interceptingWriter) WriteHeader(code int) {
 	w.code = code
 	w.ResponseWriter.WriteHeader(code)
+}
+
+// StatusCoder is checked by DefaultErrorEncoder. If an error value implements
+// StatusCoder, the StatusCode will be used when encoding the error. By default,
+// StatusInternalServerError (500) is used.
+type StatusCoder interface {
+	StatusCode() int
+}
+
+// Headerer is checked by DefaultErrorEncoder. If an error value implements
+// Headerer, the provided headers will be applied to the response writer, after
+// the Content-Type is set.
+type Headerer interface {
+	Headers() http.Header
 }
